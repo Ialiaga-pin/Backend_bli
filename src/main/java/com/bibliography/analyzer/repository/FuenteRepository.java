@@ -1,0 +1,266 @@
+package com.bibliography.analyzer.repository;
+
+import com.bibliography.analyzer.dominio.url.WebMetadata;
+import org.springframework.stereotype.Repository;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+@Repository
+@ConditionalOnProperty(name = "app.modulo.url.enabled", havingValue = "true", matchIfMissing = true)
+public class FuenteRepository {
+
+    public static class DataBaseException extends RuntimeException {
+        public DataBaseException(String mensaje, SQLException causa) { super(mensaje, causa); }
+    }
+
+    // ✅ FuenteRow actualizado: sin textContent, con wordCount y score
+    public record FuenteRow(long id, String url, String domain, String title, String topic,
+                            String author, String publishedDate, int wordCount, int score,
+                            String createdAt) {}
+
+    // ✅ Lista única de columnas para todos los SELECT
+    private static final String COLUMNAS =
+            "id, url, domain, title, author, published_date, topic, word_count, score, created_at";
+
+    private final String dbUrl;
+    private final boolean isPostgres;
+
+    public FuenteRepository() {
+        String env = System.getenv("DB_URL");
+        String prop = System.getProperty("db.url");
+        this.dbUrl = (env != null && !env.isBlank()) ? env.trim()
+                : (prop != null && !prop.isBlank()) ? prop.trim()
+                : "jdbc:sqlite:metadata.db";
+        this.isPostgres = dbUrl.startsWith("jdbc:postgresql");
+        try {
+            Class.forName(isPostgres ? "org.postgresql.Driver" : "org.sqlite.JDBC");
+        } catch (ClassNotFoundException e) {
+            throw new IllegalStateException("Driver JDBC no encontrado para: " + dbUrl, e);
+        }
+        initSchema();
+    }
+
+    private Connection getConnection() throws SQLException {
+        return DriverManager.getConnection(dbUrl);
+    }
+
+    private void initSchema() {
+        try (Connection conn = getConnection(); Statement stmt = conn.createStatement()) {
+            if (isPostgres) {
+                stmt.execute("CREATE TABLE IF NOT EXISTS web_metadata ("
+                        + "id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
+                        + "url TEXT NOT NULL, "
+                        + "domain VARCHAR(255) NOT NULL, "
+                        + "title VARCHAR(512), "
+                        + "author VARCHAR(255), "
+                        + "published_date VARCHAR(100), "
+                        + "word_count INTEGER, "
+                        + "topic VARCHAR(255), "
+                        + "score INTEGER, "
+                        + "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)");
+                stmt.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_web_metadata_url_md5 "
+                        + "ON web_metadata (md5(url))");
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_web_metadata_domain "
+                        + "ON web_metadata (domain)");
+            } else {
+                stmt.execute("CREATE TABLE IF NOT EXISTS web_metadata ("
+                        + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                        + "url TEXT NOT NULL UNIQUE, "
+                        + "domain TEXT NOT NULL, "
+                        + "title TEXT, "
+                        + "author TEXT, "
+                        + "published_date TEXT, "
+                        + "word_count INTEGER, "
+                        + "topic TEXT, "
+                        + "score INTEGER, "
+                        + "created_at DATETIME DEFAULT CURRENT_TIMESTAMP)");
+            }
+        } catch (SQLException e) {
+            throw new DataBaseException("No se pudo inicializar la base de datos.", e);
+        }
+    }
+
+    public boolean exists(String url) {
+        String sql = "SELECT COUNT(*) FROM web_metadata WHERE url = ?";
+        try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, url);
+            ResultSet rs = ps.executeQuery();
+            return rs.next() && rs.getInt(1) > 0;
+        } catch (SQLException e) {
+            throw new DataBaseException("Error al verificar existencia.", e);
+        }
+    }
+
+    // ✅ save() corregido: usa wordCount y score de WebMetadata
+    public void save(WebMetadata m) {
+        String conflicto = isPostgres ? "ON CONFLICT (md5(url))" : "ON CONFLICT(url)";
+        String sql = "INSERT INTO web_metadata (url, domain, title, author, published_date, word_count, topic, score) "
+                + "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                + conflicto + " DO UPDATE SET title = excluded.title, author = excluded.author, "
+                + "published_date = excluded.published_date, word_count = excluded.word_count, "
+                + "topic = excluded.topic, score = excluded.score, created_at = CURRENT_TIMESTAMP";
+        try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, m.url());
+            ps.setString(2, m.domain());
+            ps.setString(3, m.title());
+            ps.setString(4, m.author());
+            ps.setString(5, m.publishedDate());
+            ps.setInt(6, m.wordCount());
+            ps.setString(7, m.topic());
+            ps.setInt(8, m.score());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new DataBaseException("Error al guardar metadatos.", e);
+        }
+    }
+
+    // ✅ Todos los SELECT usan la constante COLUMNAS
+    public Optional<FuenteRow> findByUrl(String url) {
+        String sql = "SELECT " + COLUMNAS + " FROM web_metadata WHERE url = ?";
+        try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, url);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) return Optional.of(map(rs));
+            return Optional.empty();
+        } catch (SQLException e) {
+            throw new DataBaseException("Error al consultar por URL.", e);
+        }
+    }
+
+    public Optional<FuenteRow> findById(long id) {
+        String sql = "SELECT " + COLUMNAS + " FROM web_metadata WHERE id = ?";
+        try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, id);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) return Optional.of(map(rs));
+            return Optional.empty();
+        } catch (SQLException e) {
+            throw new DataBaseException("Error al consultar por id.", e);
+        }
+    }
+
+    public List<FuenteRow> findAll() {
+        List<FuenteRow> out = new ArrayList<>();
+        String sql = "SELECT " + COLUMNAS + " FROM web_metadata ORDER BY id";
+        try (Connection conn = getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) out.add(map(rs));
+            return out;
+        } catch (SQLException e) {
+            throw new DataBaseException("Error al listar fuentes.", e);
+        }
+    }
+
+    public boolean update(long id, String title, String author, String topic) {
+        List<String> sets = new ArrayList<>();
+        List<String> values = new ArrayList<>();
+        if (title != null)  { sets.add("title = ?");  values.add(title); }
+        if (author != null) { sets.add("author = ?"); values.add(author); }
+        if (topic != null)  { sets.add("topic = ?");  values.add(topic); }
+        if (sets.isEmpty()) return findById(id).isPresent();
+        sets.add("created_at = CURRENT_TIMESTAMP");
+        String sql = "UPDATE web_metadata SET " + String.join(", ", sets) + " WHERE id = ?";
+        try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            int i = 1;
+            for (String v : values) ps.setString(i++, v);
+            ps.setLong(i, id);
+            return ps.executeUpdate() > 0;
+        } catch (SQLException e) {
+            throw new DataBaseException("Error al actualizar fuente.", e);
+        }
+    }
+
+    public boolean deleteById(long id) {
+        String sql = "DELETE FROM web_metadata WHERE id = ?";
+        try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, id);
+            return ps.executeUpdate() > 0;
+        } catch (SQLException e) {
+            throw new DataBaseException("Error al eliminar fuente.", e);
+        }
+    }
+
+    public boolean hasMatchingTopicCount(String topic, String excludeUrl, int expectedCount) {
+        if (topic == null || topic.isBlank()) return expectedCount == 0;
+        List<String> keywords = keywords(topic);
+        if (keywords.isEmpty()) return expectedCount == 0;
+        StringBuilder sql = new StringBuilder("SELECT COUNT(*) FROM web_metadata WHERE (");
+        for (int i = 0; i < keywords.size(); i++) {
+            if (i > 0) sql.append(" OR ");
+            sql.append("LOWER(topic) LIKE LOWER(?)");
+        }
+        sql.append(")");
+        boolean exclude = excludeUrl != null && !excludeUrl.isBlank();
+        if (exclude) sql.append(" AND url != ?");
+        try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+            int i = 1;
+            for (String k : keywords) ps.setString(i++, "%" + k + "%");
+            if (exclude) ps.setString(i++, excludeUrl.trim());
+            ResultSet rs = ps.executeQuery();
+            return rs.next() && rs.getInt(1) >= expectedCount;
+        } catch (SQLException e) {
+            throw new DataBaseException("Error al contar instancias por tópico.", e);
+        }
+    }
+
+    public List<FuenteRow> similaresPorTopic(String topic, String excludeUrl, int limit) {
+        List<FuenteRow> out = new ArrayList<>();
+        if (topic == null || topic.isBlank() || limit <= 0) return out;
+        List<String> keywords = keywords(topic);
+        if (keywords.isEmpty()) return out;
+        StringBuilder sql = new StringBuilder("SELECT " + COLUMNAS + " FROM web_metadata WHERE (");
+        for (int i = 0; i < keywords.size(); i++) {
+            if (i > 0) sql.append(" OR ");
+            sql.append("LOWER(topic) LIKE LOWER(?)");
+        }
+        sql.append(")");
+        boolean exclude = excludeUrl != null && !excludeUrl.isBlank();
+        if (exclude) sql.append(" AND url != ?");
+        sql.append(" LIMIT ?");
+        try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+            int i = 1;
+            for (String k : keywords) ps.setString(i++, "%" + k + "%");
+            if (exclude) ps.setString(i++, excludeUrl.trim());
+            ps.setInt(i, limit);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) out.add(map(rs));
+            return out;
+        } catch (SQLException e) {
+            throw new DataBaseException("Error al buscar similares por tópico.", e);
+        }
+    }
+
+    private static List<String> keywords(String topic) {
+        return Arrays.stream(topic.split("[/,\\s]+"))
+                .map(String::trim)
+                .filter(term -> term.length() > 2)
+                .collect(Collectors.toList());
+    }
+
+    // ✅ map() corregido: lee word_count y score como INT
+    private static FuenteRow map(ResultSet rs) throws SQLException {
+        return new FuenteRow(
+                rs.getLong("id"),
+                rs.getString("url"),
+                rs.getString("domain"),
+                rs.getString("title"),
+                rs.getString("topic"),
+                rs.getString("author"),
+                rs.getString("published_date"),
+                rs.getInt("word_count"),
+                rs.getInt("score"),
+                rs.getString("created_at"));
+    }
+}
